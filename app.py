@@ -2,57 +2,46 @@ import streamlit as st
 import pandas as pd
 import requests
 import re
-import json
 import time
 
 # ==========================================
-# 备用防线：如果动态扫描意外失败，启用此备用库保证系统不瘫痪
+# 0. 强制置顶：你要求添加的核心板块
 # ==========================================
-FALLBACK_SECTORS = {
-    "【概念】低空经济": "chgn_700295",
-    "【概念】机器人概念": "chgn_700251",
-    "【概念】固态电池": "chgn_700249",
-    "【概念】人工智能": "chgn_700116",
-    "【概念】算力租赁": "chgn_700234",
-    "【行业】半导体": "new_bl_bdt",
-    "【行业】汽车行业": "new_bl_qchy",
-    "【行业】医疗器械": "new_bl_ylqx"
+CUSTOM_SECTORS = {
+    "📌【特加】稀土永磁": "chgn_700063",
+    "📌【特加】化工行业": "new_bl_hghy",
+    "📌【特加】有色金属": "new_bl_ysjs",
+    "📌【特加】算力租赁": "chgn_700234",
+    "📌【特加】低空经济": "chgn_700295"
 }
 
 def get_headers():
     return {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0"}
 
 # ==========================================
-# 1. 动态板块扫描 (修复了极其脆弱的解析逻辑)
+# 1. 获取全市场板块目录 (优化了解析逻辑)
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_sectors_safely():
     url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodes"
-    sectors = {}
+    sectors = CUSTOM_SECTORS.copy() # 把你要求的板块强行放在最前面
+    
     try:
         res = requests.get(url, headers=get_headers(), timeout=5)
-        text = res.text
-        
-        # 终极暴力正则：直接从长字符串中硬抠“中文名”和“对应代码”，无视任何 JSON 格式错误
-        # 概念代码特征：chgn_开头； 行业代码特征：new_bl_开头
-        matches = re.findall(r'["\']?([^"\',:{}\[\]]+)["\']?\s*[,:]\s*["\']?(chgn_\d+|new_bl_[a-zA-Z0-9]+)["\']?', text)
+        # 精准匹配新浪目录格式：提取板块名和对应的代码
+        matches = re.findall(r'"([^"]+)"\s*,\s*"(chgn_\d+|new_bl_[a-z_]+)"', res.text)
         
         for name, code in matches:
-            # 清洗名字中的无效字符
-            name = name.replace("name", "").replace("\"", "").strip()
-            if len(name) > 1 and len(name) < 10: # 只保留正常的中文名
-                prefix = "【概念】" if code.startswith("chgn_") else "【行业】"
-                sectors[f"{prefix}{name}"] = code
-                
-        if len(sectors) > 50:
-            return sectors, "📡 成功实时扫描全市场动态板块"
-        else:
-            return FALLBACK_SECTORS, "⚠️ 扫描结果过少，已启用系统内置热门板块库"
+            if name in ["概念板块", "行业板块", "地域板块"]: continue
+            prefix = "【概念】" if code.startswith("chgn_") else "【行业】"
+            sectors[f"{prefix}{name}"] = code
+            
+        return sectors, f"📡 成功加载 {len(sectors)} 个板块目录"
     except Exception as e:
-        return FALLBACK_SECTORS, f"⚠️ 网络异常，已启用系统内置板块库 ({e})"
+        return sectors, f"⚠️ 网络原因未获取全部目录，已加载核心基础目录"
 
 # ==========================================
-# 2. 新浪拿名单 + 腾讯拿数据 (加入你说的访问限频)
+# 2. 核心修复：纯正则提取名单 + 腾讯限频获取数据
 # ==========================================
 @st.cache_data(ttl=60)
 def fetch_data_sina_tencent(node_code):
@@ -64,19 +53,22 @@ def fetch_data_sina_tencent(node_code):
     
     try:
         s_res = requests.get(sina_url, params=params, headers=get_headers(), timeout=5)
-        # 修复新浪残缺JSON的经典方法
-        fixed_text = re.sub(r'([{,])\s*([a-zA-Z_]\w*)\s*:', r'\1"\2":', s_res.text)
-        sina_data = json.loads(fixed_text)
-        symbols = [item['symbol'] for item in sina_data if 'symbol' in item]
+        
+        # 【根本性修复】彻底抛弃脆弱的 json.loads！
+        # 像激光一样，直接从乱码中抠出所有的 shXXXXXX 和 szXXXXXX 股票代码
+        symbols = re.findall(r'symbol\s*:\s*["\']?(s[hz]\d{6})["\']?', s_res.text)
+        
+        # 去重，防止新浪返回重复数据
+        symbols = list(dict.fromkeys(symbols)) 
     except Exception as e:
-        st.error("获取板块成分股名单失败。")
+        st.error("获取板块成分股名单失败")
         return pd.DataFrame()
 
     if not symbols: return pd.DataFrame()
 
-    # --- 第二步：腾讯拿数据 (加入限频 time.sleep) ---
+    # --- 第二步：腾讯拿数据 (带限频保护) ---
     clean_data = []
-    chunk_size = 50 # 每次只向腾讯查 50 个，避免 URL 过长被拦截
+    chunk_size = 50 # 每次只发 50 个代码，防止 URL 超载
     
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
@@ -106,7 +98,7 @@ def fetch_data_sina_tencent(node_code):
                     "市净率(PB)": to_float(fields[46]),    
                     "总市值(亿)": to_float(fields[45]),    
                 })
-            # 【核心修复】控制访问频率，每次请求腾讯后停顿 0.1 秒
+            # 【限频保护】每次向腾讯请求后强制休息 0.1 秒
             time.sleep(0.1) 
         except Exception:
             continue
@@ -114,25 +106,22 @@ def fetch_data_sina_tencent(node_code):
     return pd.DataFrame(clean_data)
 
 # ==========================================
-# 3. Streamlit 界面
+# 3. Streamlit UI 渲染
 # ==========================================
-st.set_page_config(page_title="回归稳定版雷达", layout="wide")
-st.markdown("### 🦅 稳定双擎版：新浪目录 + 腾讯行情 (带防崩溃机制)")
+st.set_page_config(page_title="最强解封版雷达", layout="wide")
+st.markdown("### 🦅 极致稳定版：新浪名单 + 腾讯行情 (纯正则提取版)")
 
-# 获取动态板块
 dynamic_sectors, status_msg = fetch_sectors_safely()
-st.caption(status_msg) # 在标题下方显示当前扫描状态
+st.caption(status_msg)
 
-# 侧边栏设置
 st.sidebar.header("🎯 1. 搜索与选择板块")
-# selectbox自带全拼音/中文搜索功能
 selected_sector_name = st.sidebar.selectbox(
-    "输入关键词搜索 (例如: 算力 / 低空)：", 
+    "输入关键词搜索 (例如: 稀土 / 化工 / 有色)：", 
     list(dynamic_sectors.keys())
 )
 
 st.sidebar.markdown("---")
-st.sidebar.header("🎯 2. 量化漏斗")
+st.sidebar.header("🎯 2. 量化漏斗过滤")
 max_pe = st.sidebar.slider("最大动态市盈率 (PE)", 0, 300, 100)
 max_mkt_cap = st.sidebar.slider("最大总市值 (亿)", 10, 5000, 1000)
 min_turn = st.sidebar.number_input("最小换手率 (%)", value=2.0, step=0.5)
@@ -141,8 +130,7 @@ price_range = st.sidebar.slider("今日涨跌幅区间 (%)", -10.0, 11.0, (0.0, 
 node_code = dynamic_sectors.get(selected_sector_name)
 st.markdown(f"#### 正在监控：**{selected_sector_name}**")
 
-# 拉取与过滤数据
-with st.spinner(f"正在读取 {selected_sector_name} 实时数据... (已开启限频保护)"):
+with st.spinner(f"正在读取 {selected_sector_name} 实时数据... (已开启正则穿透)"):
     df_stocks = fetch_data_sina_tencent(node_code)
 
 if not df_stocks.empty:
@@ -153,7 +141,7 @@ if not df_stocks.empty:
     df_filtered = df_filtered[(df_filtered['涨跌幅(%)'] >= price_range[0]) & (df_filtered['涨跌幅(%)'] <= price_range[1])]
     df_filtered = df_filtered.sort_values(by="换手率(%)", ascending=False)
     
-    st.markdown(f"📦 板块共 **{len(df_stocks)}** 只成分股。漏斗过滤后剩余 **{len(df_filtered)}** 只！")
+    st.markdown(f"📦 该板块共有 **{len(df_stocks)}** 只成分股。量化漏斗过滤后剩余 **{len(df_filtered)}** 只！")
     
     if not df_filtered.empty:
         def color_change(val):
@@ -167,9 +155,9 @@ if not df_stocks.empty:
                             })
         st.dataframe(styled_df, use_container_width=True, height=400)
     else:
-        st.warning("⚠️ 条件太苛刻啦，该板块内的股票全军覆没。")
+        st.warning("⚠️ 条件太苛刻，该板块内的股票已被漏斗全部拦截。")
         
-    with st.expander("🔍 点击查看全部底层原始数据（未过滤）"):
+    with st.expander("🔍 点击查看：腾讯接口返回的全部底层数据（未过滤）"):
         st.dataframe(df_stocks, use_container_width=True)
 else:
-    st.error("未能获取到数据，可能是休市或该板块数据为空。")
+    st.error("未能获取到数据。可能是休市或该板块内无数据。")
