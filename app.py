@@ -1,112 +1,78 @@
 import streamlit as st
 import pandas as pd
 import requests
-import urllib.request
-import urllib.parse
+import re
 import json
-import random
 
 # ==========================================
-# 0. 东方财富内部精准板块代码 (BK Code)
+# 0. 新浪财经专属板块代码 (拼音缩写/行业代码)
 # ==========================================
-BASE_SECTORS = {
-    "📌【特加】稀土永磁": "BK0578",
-    "📌【特加】化工行业(化学制品)": "BK0465", 
-    "📌【特加】有色金属": "BK0478",
-    "【概念】低空经济": "BK1166",
-    "【概念】机器人概念": "BK1090",
-    "【概念】固态电池": "BK0968",
-    "【概念】人工智能": "BK0800",
-    "【概念】算力租赁": "BK1134",
-    "【行业】半导体": "BK1036",
-    "【行业】汽车整车": "BK1029",
-    "【行业】医疗器械": "BK1041"
+SINA_SECTORS = {
+    "📌【特加】稀土永磁": "concept_xtyc",
+    "📌【特加】化工行业(化学制品)": "sinaindustry_42", 
+    "📌【特加】有色金属": "sinaindustry_50",
+    "【概念】低空经济": "concept_dkjj",      # 注：新概念若新浪未更新可能为空
+    "【概念】机器人概念": "concept_jqr",
+    "【概念】固态电池": "concept_gtdc",
+    "【概念】人工智能": "concept_rgzn",
+    "【概念】算力租赁": "concept_slgn",
+    "【行业】半导体": "sinaindustry_46",
+    "【行业】汽车整车": "sinaindustry_43",
+    "【行业】医疗器械": "sinaindustry_38"
 }
 
 # ==========================================
-# 1. 降维打击网络引擎 (HTTP降级 + Urllib原生穿透)
+# 1. 新浪财经直连引擎 (完全无视拦截)
 # ==========================================
 @st.cache_data(ttl=15)
-def fetch_eastmoney_data(bk_code):
-    # 核心修改1：去掉了 HTTPS，恢复纯 HTTP 协议，迎合东方财富老旧服务器
-    # 核心修改2：准备了多个备用节点服务器
-    endpoints = [
-        "http://push2.eastmoney.com/api/qt/clist/get",
-        "http://82.push2.eastmoney.com/api/qt/clist/get",
-        "http://push2n.eastmoney.com/api/qt/clist/get"
-    ]
-    
-    params = f"pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=b:{bk_code}&fields=f12,f14,f2,f3,f8,f9,f23,f20"
+def fetch_sina_data(node_code):
+    # 新浪财经 VIP 节点，按涨跌幅排序，拉取前 500 只股票
+    target_url = f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=500&sort=changepercent&asc=0&node={node_code}"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Referer": "http://quote.eastmoney.com/",
-        "Accept": "application/json, text/plain, */*",
-        "Connection": "keep-alive"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "http://finance.sina.com.cn/"
     }
 
-    debug_log = []
-
-    # --- 策略1：使用 Python 原生 Urllib 库直连 (无视 requests 防火墙) ---
-    for base_url in endpoints:
-        full_url = f"{base_url}?{params}"
-        try:
-            req = urllib.request.Request(full_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=4) as response:
-                raw_data = response.read().decode('utf-8')
-                json_data = json.loads(raw_data)
-                if json_data and json_data.get("data"):
-                    return parse_json_to_df(json_data), f"原生 Urllib 成功 ({base_url.split('/')[2]})"
-                else:
-                    debug_log.append(f"Urllib [{base_url.split('/')[2]}]: 返回空")
-        except Exception as e:
-            debug_log.append(f"Urllib [{base_url.split('/')[2]}] 失败: {str(e)[:40]}")
-
-    # --- 策略2：使用常规 Requests 库直连 ---
-    for base_url in endpoints:
-        full_url = f"{base_url}?{params}"
-        try:
-            res = requests.get(full_url, headers=headers, timeout=4)
-            if res.status_code == 200:
-                json_data = res.json()
-                if json_data and json_data.get("data"):
-                    return parse_json_to_df(json_data), f"Requests 成功 ({base_url.split('/')[2]})"
-        except Exception as e:
-            debug_log.append(f"Requests [{base_url.split('/')[2]}] 失败: {str(e)[:40]}")
-
-    # --- 策略3：AllOrigins 包装代理 (避免 Raw 超时) ---
     try:
-        # 这次不用 raw，而是用 get 将数据包装成 JSON，解决上次 Read timed out 的问题
-        proxy_url = f"https://api.allorigins.win/get?url={urllib.parse.quote(endpoints[0] + '?' + params)}"
-        res = requests.get(proxy_url, timeout=12)
-        if res.status_code == 200:
-            wrapper = res.json()
-            if "contents" in wrapper:
-                json_data = json.loads(wrapper["contents"])
-                if json_data and json_data.get("data"):
-                    return parse_json_to_df(json_data), "AllOrigins (JSON包装模式)"
+        # 新浪接口从不拦截，直接使用 requests 裸连即可
+        res = requests.get(target_url, headers=headers, timeout=8)
+        text = res.text
+        
+        if not text or text.strip() == "null":
+            return pd.DataFrame(), "新浪数据库尚未收录该板块"
+
+        # 黑科技：新浪返回的 JSON 键值没有双引号 (比如 {symbol:"sh600..."})，Python 会报错
+        # 我们用正则表达式强行给它的 Key 加上双引号，修复新浪的 JSON
+        fixed_text = re.sub(r'([{,])\s*([a-zA-Z_0-9]+)\s*:', r'\1"\2":', text)
+        
+        raw_json = json.loads(fixed_text)
+        
+        if not raw_json or len(raw_json) == 0:
+            return pd.DataFrame(), "该板块目前为空"
+            
+        return parse_sina_to_df(raw_json), "新浪财经 VIP 接口直连"
+        
     except Exception as e:
-        debug_log.append(f"AllOrigins 包装模式失败: {str(e)[:40]}")
+        return pd.DataFrame(), f"请求出错: {str(e)[:50]}"
 
-    return pd.DataFrame(), debug_log
-
-def parse_json_to_df(raw_json):
-    stock_list = raw_json.get("data", {}).get("diff", [])
+def parse_sina_to_df(raw_json):
     clean_data = []
-    for s in stock_list:
+    for s in raw_json:
         def to_float(val):
-            try: return float(val) if val != "-" else 0.0
+            try: return float(val)
             except: return 0.0
 
         clean_data.append({
-            "代码": str(s.get("f12", "")),
-            "名称": str(s.get("f14", "")),
-            "最新价": to_float(s.get("f2")),
-            "涨跌幅(%)": to_float(s.get("f3")),
-            "换手率(%)": to_float(s.get("f8")),
-            "市盈率(PE)": to_float(s.get("f9")),
-            "市净率(PB)": to_float(s.get("f23")),
-            "总市值(亿)": to_float(s.get("f20")) / 100000000.0 if s.get("f20") and s.get("f20") != "-" else 0.0
+            "代码": str(s.get("symbol", "")).replace("sh", "").replace("sz", ""),
+            "名称": str(s.get("name", "")),
+            "最新价": to_float(s.get("trade")),
+            "涨跌幅(%)": to_float(s.get("changepercent")),
+            "换手率(%)": to_float(s.get("turnoverratio")),
+            "市盈率(PE)": to_float(s.get("per")),
+            "市净率(PB)": to_float(s.get("pb")),
+            # 新浪的总市值单位是"万元"，需要除以10000转换成"亿元"
+            "总市值(亿)": to_float(s.get("mktcap")) / 10000.0
         })
     return pd.DataFrame(clean_data)
 
@@ -114,10 +80,10 @@ def parse_json_to_df(raw_json):
 # 2. 页面与组件渲染
 # ==========================================
 st.set_page_config(page_title="游资板块透视", layout="wide")
-st.markdown("### 🦅 游资雷达：原生 HTTP 降维打击版")
+st.markdown("### 🦅 游资雷达：新浪财经光速直连版")
 
 st.sidebar.header("🎯 1. 选择板块")
-selected_sector = st.sidebar.selectbox("请选择要扫描的板块：", list(BASE_SECTORS.keys()))
+selected_sector = st.sidebar.selectbox("请选择要扫描的板块：", list(SINA_SECTORS.keys()))
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎯 2. 量化漏斗过滤")
@@ -127,16 +93,15 @@ max_mkt_cap = st.sidebar.slider("最大总市值 (亿)", 10, 5000, 1000)
 min_turn = st.sidebar.number_input("最小换手率 (%) [填0看全部]", value=2.0, step=0.5)
 price_range = st.sidebar.slider("今日涨跌幅区间 (%)", -10.0, 11.0, (-10.0, 11.0), step=0.5)
 
-bk_code = BASE_SECTORS[selected_sector]
-st.markdown(f"#### 正在监控：**{selected_sector}** (内部代码: {bk_code})")
+node_code = SINA_SECTORS[selected_sector]
+st.markdown(f"#### 正在监控：**{selected_sector}** (新浪节点: {node_code})")
 
 # 加载数据
-with st.spinner("🚀 正在使用纯净 HTTP 协议请求数据 (预计2~5秒)..."):
-    result, debug_info = fetch_eastmoney_data(bk_code)
+with st.spinner("🚀 正在从新浪财经拉取实时数据 (预计 1~2 秒)..."):
+    df_stocks, status_msg = fetch_sina_data(node_code)
 
-if not result.empty:
-    df_stocks = result
-    st.success(f"✅ 数据拉取成功！当前使用通道: **{debug_info}**")
+if not df_stocks.empty:
+    st.success(f"✅ 数据拉取成功！通道状态: **{status_msg}**")
     
     df_filtered = df_stocks.copy()
     
@@ -165,10 +130,9 @@ if not result.empty:
     else:
         st.warning("⚠️ 漏斗条件太苛刻！你把左侧的【最小换手率】改成 0 看看。")
         
-    with st.expander("🔍 展开查看：东方财富返回的【全量原始数据】（无视漏斗）"):
+    with st.expander("🔍 展开查看：新浪财经返回的【全量原始数据】（无视漏斗）"):
         st.dataframe(df_stocks, use_container_width=True)
 else:
-    st.error("❌ 拉取失败！")
-    st.error("👇 错误诊断日志：")
-    for log in debug_info:
-        st.code(log)
+    st.warning(f"📭 当前板块暂无数据。")
+    st.error(f"系统提示：**{status_msg}**")
+    st.info("💡 解释：如果是【低空经济】这种2024年刚出的新概念，新浪财经官方可能还未给它建立专属板块数据库，建议查看其他经典老版块！")
