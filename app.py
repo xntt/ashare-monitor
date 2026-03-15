@@ -22,75 +22,79 @@ BASE_SECTORS = {
 }
 
 # ==========================================
-# 1. 终极反爬虫网络引擎 (IP伪装 + 3重代理轮换)
+# 1. 终极穿透引擎 (备用节点轮询 + 代理高延迟容忍)
 # ==========================================
 @st.cache_data(ttl=15)
 def fetch_eastmoney_data(bk_code):
-    target_url = f"http://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=b:{bk_code}&fields=f12,f14,f2,f3,f8,f9,f23,f20"
+    # 黑科技1：东方财富边缘节点大轮盘，避开主服务器的严厉封锁
+    subdomains = ["push2", "8.push2", "11.push2", "90.push2", "78.push2", "5.push2"]
+    sub = random.choice(subdomains)
     
-    # 核心黑科技：每次请求随机生成一个国内的虚拟 IP 地址，欺骗东方财富 WAF 防火墙
-    fake_ip = f"{random.randint(114, 115)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
+    # 黑科技2：强制使用 https 加密协议
+    target_url = f"https://{sub}.eastmoney.com/api/qt/clist/get?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=b:{bk_code}&fields=f12,f14,f2,f3,f8,f9,f23,f20"
+    
+    # 随机 User-Agent 防止被指纹识别
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+    ]
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "http://quote.eastmoney.com/",
-        "X-Forwarded-For": fake_ip,  # 伪装 IP
-        "X-Real-IP": fake_ip         # 伪装 IP
+        "User-Agent": random.choice(user_agents),
+        "Referer": "https://quote.eastmoney.com/"
     }
 
-    # 用于记录失败原因，方便排错
     debug_log = []
-    raw_json = None
+    
+    def try_parse(response):
+        """安全解析JSON，防止代理返回死网页导致崩溃"""
+        try:
+            return response.json()
+        except Exception:
+            return None
 
-    # --- 策略1：注入虚拟IP直连 ---
+    # --- 策略1：加密直连边缘节点 ---
     try:
-        res = requests.get(target_url, headers=headers, timeout=4)
+        res = requests.get(target_url, headers=headers, timeout=5)
         if res.status_code == 200:
-            raw_json = res.json()
-            if raw_json.get("data"): 
-                return parse_json_to_df(raw_json), "直连+IP伪装"
+            raw_json = try_parse(res)
+            if raw_json and raw_json.get("data"): 
+                return parse_json_to_df(raw_json), f"直连穿透 ({sub}节点)"
             else:
-                debug_log.append("直连成功但被东方财富拦截(返回空data)")
-                raw_json = None
+                debug_log.append(f"直连[{sub}]: 被拦截返回非数据内容")
     except Exception as e:
-        debug_log.append(f"直连失败: {str(e)}")
+        debug_log.append(f"直连失败: {str(e)[:50]}")
 
     encoded_url = urllib.parse.quote(target_url)
 
-    # --- 策略2：Corsproxy 代理兜底 ---
-    if not raw_json:
-        try:
-            proxy_url = f"https://corsproxy.io/?{encoded_url}"
-            res = requests.get(proxy_url, timeout=6)
-            if res.status_code == 200:
-                raw_json = res.json()
-                if raw_json.get("data"): return parse_json_to_df(raw_json), "Corsproxy代理"
-        except Exception as e:
-            debug_log.append(f"Corsproxy失败: {str(e)}")
+    # --- 策略2：Allorigins 超长续航 (解决 Read timed out 痛点) ---
+    try:
+        proxy_url = f"https://api.allorigins.win/raw?url={encoded_url}"
+        # 核心：将超时从 6 秒拉大到 15 秒！等它！
+        res = requests.get(proxy_url, timeout=15)
+        if res.status_code == 200:
+            raw_json = try_parse(res)
+            if raw_json and raw_json.get("data"): 
+                return parse_json_to_df(raw_json), "AllOrigins(15秒高延迟兜底)"
+            else:
+                debug_log.append("Allorigins: 返回了错误的数据格式")
+    except Exception as e:
+        debug_log.append(f"Allorigins失败: {str(e)[:50]}")
 
-    # --- 策略3：Codetabs 代理兜底 ---
-    if not raw_json:
-        try:
-            proxy_url = f"https://api.codetabs.com/v1/proxy?quest={target_url}"
-            res = requests.get(proxy_url, timeout=6)
-            if res.status_code == 200:
-                raw_json = res.json()
-                if raw_json.get("data"): return parse_json_to_df(raw_json), "Codetabs代理"
-        except Exception as e:
-            debug_log.append(f"Codetabs失败: {str(e)}")
+    # --- 策略3：Thingproxy 备用通道 ---
+    try:
+        proxy_url = f"https://thingproxy.freeboard.io/fetch/{target_url}"
+        res = requests.get(proxy_url, timeout=10)
+        if res.status_code == 200:
+            raw_json = try_parse(res)
+            if raw_json and raw_json.get("data"): 
+                return parse_json_to_df(raw_json), "ThingProxy通道"
+            else:
+                debug_log.append("ThingProxy: 格式错误或被阻挡")
+    except Exception as e:
+        debug_log.append(f"ThingProxy失败: {str(e)[:50]}")
 
-    # --- 策略4：Allorigins 代理兜底 ---
-    if not raw_json:
-        try:
-            proxy_url = f"https://api.allorigins.win/raw?url={encoded_url}"
-            res = requests.get(proxy_url, timeout=6)
-            if res.status_code == 200:
-                raw_json = res.json()
-                if raw_json.get("data"): return parse_json_to_df(raw_json), "AllOrigins代理"
-        except Exception as e:
-            debug_log.append(f"Allorigins失败: {str(e)}")
-
-    # 如果全军覆没，返回错误日志
     return pd.DataFrame(), debug_log
 
 def parse_json_to_df(raw_json):
@@ -117,7 +121,7 @@ def parse_json_to_df(raw_json):
 # 2. 页面与组件渲染
 # ==========================================
 st.set_page_config(page_title="游资板块透视", layout="wide")
-st.markdown("### 🦅 终极反侦察版：多重代理 + IP伪装防拦截")
+st.markdown("### 🦅 游资雷达：东方财富直连防断版")
 
 st.sidebar.header("🎯 1. 选择板块")
 selected_sector = st.sidebar.selectbox("请选择要扫描的板块：", list(BASE_SECTORS.keys()))
@@ -134,7 +138,7 @@ bk_code = BASE_SECTORS[selected_sector]
 st.markdown(f"#### 正在监控：**{selected_sector}** (内部代码: {bk_code})")
 
 # 加载数据
-with st.spinner("🚀 正在注入虚拟IP，尝试突破东方财富封锁..."):
+with st.spinner("🚀 正在强行穿透东方财富服务器 (最长可能等待15秒，请耐心)..."):
     result, debug_info = fetch_eastmoney_data(bk_code)
 
 if not result.empty:
@@ -171,7 +175,7 @@ if not result.empty:
     with st.expander("🔍 展开查看：东方财富返回的【全量原始数据】（无视漏斗）"):
         st.dataframe(df_stocks, use_container_width=True)
 else:
-    st.error("❌ 严重错误：突破东方财富失败！所有通道均被拦截！")
-    st.error("👇 错误诊断日志（如果还失败，请把这段日志截图给我看）：")
+    st.error("❌ 破防失败！15秒超时内未能穿透。")
+    st.error("👇 错误诊断日志：")
     for log in debug_info:
         st.code(log)
