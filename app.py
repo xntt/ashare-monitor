@@ -1,145 +1,169 @@
 import streamlit as st
 import pandas as pd
-import requests
-import re
-import time
+import akshare as ak
 
 # ==========================================
-# 0. 你的原版 8 个 + 要求的 3 个核心板块
+# 0. 页面配置
 # ==========================================
-BASE_SECTORS = {
-    # --- 你要求添加的 3 个 ---
-    "📌【特加】稀土永磁": "chgn_700063",
-    "📌【特加】化工行业": "new_bl_hghy",
-    "📌【特加】有色金属": "new_bl_ysjs",
-    # --- 你原来的 8 个 ---
-    "【概念】低空经济": "chgn_700295",
-    "【概念】机器人概念": "chgn_700251",
-    "【概念】固态电池": "chgn_700249",
-    "【概念】人工智能": "chgn_700116",
-    "【概念】算力租赁": "chgn_700234",
-    "【行业】半导体": "new_bl_bdt",
-    "【行业】汽车行业": "new_bl_qchy",
-    "【行业】医疗器械": "new_bl_ylqx"
-}
-
-def get_headers():
-    # 最干爽的请求头，绝对不触发新浪任何拦截
-    return {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0"}
+st.set_page_config(page_title="Akshare 终极雷达", layout="wide")
+st.markdown("### 🦅 终极版：基于 Akshare + 东方财富全量数据")
 
 # ==========================================
-# 1. 纯正则万能提取：新浪名单 + 腾讯行情
+# 1. 动态获取全市场板块 (东方财富实时数据)
 # ==========================================
-# 【关键修复】：缓存时间缩短到 5 秒，彻底解决“空数据被卡住”的缓存BUG！
-@st.cache_data(ttl=5)
-def fetch_data_sina_tencent(node_code):
-    if not node_code: return pd.DataFrame()
-    
-    # --- 第一步：新浪拿名单 ---
-    sina_url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-    params = {"page": "1", "num": "300", "sort": "symbol", "asc": "1", "node": node_code}
+@st.cache_data(ttl=3600)
+def fetch_all_boards():
+    concepts = []
+    industries = []
+    try:
+        # 获取东方财富所有概念板块
+        df_c = ak.stock_board_concept_name_em()
+        concepts = df_c['板块名称'].tolist()
+    except Exception as e:
+        st.error(f"概念板块获取失败: {e}")
+
+    try:
+        # 获取东方财富所有行业板块
+        df_i = ak.stock_board_industry_name_em()
+        industries = df_i['板块名称'].tolist()
+    except Exception as e:
+        st.error(f"行业板块获取失败: {e}")
+
+    return concepts, industries
+
+# 加载数据
+with st.spinner("正在连接东方财富服务器，初始化全量板块目录..."):
+    all_concepts, all_industries = fetch_all_boards()
+
+# ==========================================
+# 2. 智能分类与置顶 (把你关心的板块永远放前面)
+# ==========================================
+# 你关心的核心关键词
+TARGET_KEYWORDS = ["稀土", "化工", "有色", "低空", "机器人", "固态电池", "人工智能", "算力", "半导体", "汽车", "医疗"]
+
+pinned_boards = []  # 置顶的板块
+other_boards = []   # 其他几百个板块
+
+# 扫描概念板块
+for c in all_concepts:
+    name = f"【概念】{c}"
+    if any(kw in c for kw in TARGET_KEYWORDS):
+        pinned_boards.append(name)
+    else:
+        other_boards.append(name)
+
+# 扫描行业板块
+for i in all_industries:
+    name = f"【行业】{i}"
+    if any(kw in i for kw in TARGET_KEYWORDS):
+        pinned_boards.append(name)
+    else:
+        other_boards.append(name)
+
+# 最终下拉框列表：置顶 + 其他所有
+dropdown_options = pinned_boards + other_boards
+
+# ==========================================
+# 3. 核心获取函数 (Akshare 抓取成分股)
+# ==========================================
+@st.cache_data(ttl=5) # 5秒短缓存，拒绝卡死
+def get_board_stocks(selected_name):
+    # 解析出是概念还是行业，以及真实名称
+    is_concept = "【概念】" in selected_name
+    real_name = selected_name.replace("【概念】", "").replace("【行业】", "")
     
     try:
-        s_res = requests.get(sina_url, params=params, headers=get_headers(), timeout=5)
-        # 流氓提取法：不管新浪返回什么格式，只要里面有 sh/sz 开头的6位代码，全抓出来！
-        symbols = re.findall(r'(sh\d{6}|sz\d{6})', s_res.text, re.IGNORECASE)
-        symbols = list(dict.fromkeys([s.lower() for s in symbols])) # 去重
-    except Exception:
+        if is_concept:
+            # 获取东方财富概念板块成分股
+            df = ak.stock_board_concept_cons_em(symbol=real_name)
+        else:
+            # 获取东方财富行业板块成分股
+            df = ak.stock_board_industry_cons_em(symbol=real_name)
+            
+        # 统一规范列名，对接你的量化漏斗
+        rename_map = {
+            '代码': '代码',
+            '名称': '名称',
+            '最新价': '最新价',
+            '涨跌幅': '涨跌幅(%)',
+            '换手率': '换手率(%)',
+            '市盈率-动态': '市盈率(PE)',
+            '市净率': '市净率(PB)',
+            '总市值': '原始总市值'
+        }
+        df = df.rename(columns=rename_map)
+        
+        # 将市值换算成“亿”为单位
+        if '原始总市值' in df.columns:
+            df['总市值(亿)'] = df['原始总市值'] / 100000000.0
+        else:
+            df['总市值(亿)'] = 0.0
+            
+        return df
+    except Exception as e:
         return pd.DataFrame()
 
-    if not symbols: return pd.DataFrame()
-
-    # --- 第二步：腾讯拿数据 ---
-    clean_data = []
-    chunk_size = 50 
-    
-    for i in range(0, len(symbols), chunk_size):
-        chunk = symbols[i:i + chunk_size]
-        t_url = f"http://qt.gtimg.cn/q={','.join(chunk)}"
-        
-        try:
-            t_res = requests.get(t_url, headers=get_headers(), timeout=5)
-            t_res.encoding = 'gbk' 
-            lines = t_res.text.strip().split('\n')
-            
-            for line in lines:
-                if "=" not in line: continue
-                fields = line.split('=')[1].replace('"', '').split('~')
-                if len(fields) < 47: continue 
-                
-                def to_float(val):
-                    try: return float(val)
-                    except: return 0.0
-
-                clean_data.append({
-                    "代码": fields[2],
-                    "名称": fields[1],
-                    "最新价": to_float(fields[3]),
-                    "涨跌幅(%)": to_float(fields[32]),     
-                    "换手率(%)": to_float(fields[38]),     
-                    "市盈率(PE)": to_float(fields[39]),    
-                    "市净率(PB)": to_float(fields[46]),    
-                    "总市值(亿)": to_float(fields[45]),    
-                })
-            time.sleep(0.1) 
-        except Exception:
-            continue
-
-    return pd.DataFrame(clean_data)
-
 # ==========================================
-# 2. 界面渲染
+# 4. 侧边栏与量化漏斗
 # ==========================================
-st.set_page_config(page_title="完全透视版雷达", layout="wide")
-st.markdown("### 🦅 极致稳定版：揭开新浪底层真实数据")
-
-st.sidebar.header("🎯 1. 选择板块")
-# 只显示你要求的 11 个板块，干干净净
-selected_sector_name = st.sidebar.selectbox(
-    "请选择：", 
-    list(BASE_SECTORS.keys())
-)
+st.sidebar.header("🎯 1. 选择板块 (东方财富源)")
+if dropdown_options:
+    selected_sector = st.sidebar.selectbox("下拉选择或搜索：", dropdown_options)
+else:
+    st.sidebar.error("未能加载板块，请检查网络。")
+    st.stop()
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎯 2. 量化漏斗过滤")
-st.sidebar.caption("⚠️ 注意：如果主界面没数据，请把这里调宽！")
-max_pe = st.sidebar.slider("最大动态市盈率 (PE) [调到300看亏损股]", 0, 500, 100)
+st.sidebar.caption("提示：如主界面无数据，请尝试调低换手率或放宽涨跌幅")
+max_pe = st.sidebar.slider("最大动态市盈率 (PE)", 0, 500, 100)
 max_mkt_cap = st.sidebar.slider("最大总市值 (亿)", 10, 5000, 1000)
-min_turn = st.sidebar.number_input("最小换手率 (%) [调到0可看所有股]", value=2.0, step=0.5)
-price_range = st.sidebar.slider("今日涨跌幅区间 (%)", -10.0, 11.0, (-10.0, 11.0), step=0.5) # 默认放开涨跌幅！
+min_turn = st.sidebar.number_input("最小换手率 (%) [填0看全部]", value=2.0, step=0.5)
+price_range = st.sidebar.slider("今日涨跌幅区间 (%)", -10.0, 11.0, (-10.0, 11.0), step=0.5)
 
-node_code = BASE_SECTORS.get(selected_sector_name)
-st.markdown(f"#### 正在监控：**{selected_sector_name}**")
+# ==========================================
+# 5. 数据处理与渲染
+# ==========================================
+st.markdown(f"#### 正在监控：**{selected_sector}**")
 
-with st.spinner("正在从新浪获取名单，从腾讯获取行情..."):
-    df_stocks = fetch_data_sina_tencent(node_code)
+with st.spinner("🚀 正在通过 Akshare 呼叫东方财富接口获取成分股..."):
+    df_stocks = get_board_stocks(selected_sector)
 
 if not df_stocks.empty:
+    # 开始漏斗过滤
     df_filtered = df_stocks.copy()
-    # 执行过滤
+    
+    # 过滤条件
     df_filtered = df_filtered[(df_filtered['市盈率(PE)'] > 0) & (df_filtered['市盈率(PE)'] <= max_pe)]
     df_filtered = df_filtered[df_filtered['总市值(亿)'] <= max_mkt_cap]
     df_filtered = df_filtered[df_filtered['换手率(%)'] >= min_turn]
     df_filtered = df_filtered[(df_filtered['涨跌幅(%)'] >= price_range[0]) & (df_filtered['涨跌幅(%)'] <= price_range[1])]
+    
+    # 按换手率降序
     df_filtered = df_filtered.sort_values(by="换手率(%)", ascending=False)
     
-    st.success(f"✅ 底层透视：新浪一共成功返回了 **{len(df_stocks)}** 只成分股。经过左侧漏斗过滤后，剩余 **{len(df_filtered)}** 只！")
+    # 保留核心展示列
+    display_cols = ['代码', '名称', '最新价', '涨跌幅(%)', '换手率(%)', '市盈率(PE)', '市净率(PB)', '总市值(亿)']
+    df_filtered = df_filtered[[c for c in display_cols if c in df_filtered.columns]]
+    
+    st.success(f"✅ Akshare底层透视：东方财富该板块共 **{len(df_stocks)}** 只成分股。量化漏斗过滤后剩余 **{len(df_filtered)}** 只！")
     
     if not df_filtered.empty:
         def color_change(val):
             return f"color: {'red' if val > 0 else 'green' if val < 0 else 'gray'}"
             
+        # 格式化数据并高亮
         styled_df = df_filtered.style.map(color_change, subset=['涨跌幅(%)'])\
                             .format({
                                 "最新价": "{:.2f}", "涨跌幅(%)": "{:.2f}%", 
                                 "换手率(%)": "{:.2f}%", "市盈率(PE)": "{:.2f}", 
                                 "市净率(PB)": "{:.2f}", "总市值(亿)": "{:.2f}"
                             })
-        st.dataframe(styled_df, use_container_width=True, height=400)
+        st.dataframe(styled_df, use_container_width=True, height=450)
     else:
-        st.warning("⚠️ 左侧的【换手率】或【市盈率】条件太苛刻了！该板块的票被漏斗全杀光了。你可以把换手率调成 0 试试。")
+        st.warning("⚠️ 漏斗条件太严啦！数据是有的，只是被左侧的滑块全拦住了。")
         
-    with st.expander("🔍 不信你点开看：新浪传回的【全部原始数据】（无视漏斗）"):
+    with st.expander("🔍 查看：东方财富返回的【全部原始数据】（无视漏斗）"):
         st.dataframe(df_stocks, use_container_width=True)
 else:
-    st.error("未能获取数据。可能是休市，或者网络波动，稍等几秒再试。")
+    st.error("未能获取数据。可能是休市，或者东方财富接口暂未响应，请稍后再试。")
