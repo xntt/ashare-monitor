@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import requests
 import urllib.parse
+import random
 
 # ==========================================
 # 0. 东方财富内部精准板块代码 (BK Code)
 # ==========================================
-# 纯手工精准映射，免去去东方财富拉取“全市场板块”被封IP的风险
 BASE_SECTORS = {
     "📌【特加】稀土永磁": "BK0578",
     "📌【特加】化工行业(化学制品)": "BK0465", 
@@ -22,51 +22,81 @@ BASE_SECTORS = {
 }
 
 # ==========================================
-# 1. 强健的获取逻辑 (防云端IP被封锁 + 代理兜底)
+# 1. 终极反爬虫网络引擎 (IP伪装 + 3重代理轮换)
 # ==========================================
-@st.cache_data(ttl=10) # 10秒短缓存
+@st.cache_data(ttl=15)
 def fetch_eastmoney_data(bk_code):
-    # 东方财富原生行情接口 (带有 fltt=2 解决小数问题)
-    # 字段解析: f12:代码, f14:名称, f2:最新价, f3:涨跌幅, f8:换手率, f9:动态PE, f23:市净率, f20:总市值
     target_url = f"http://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=b:{bk_code}&fields=f12,f14,f2,f3,f8,f9,f23,f20"
     
+    # 核心黑科技：每次请求随机生成一个国内的虚拟 IP 地址，欺骗东方财富 WAF 防火墙
+    fake_ip = f"{random.randint(114, 115)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "http://quote.eastmoney.com/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "http://quote.eastmoney.com/",
+        "X-Forwarded-For": fake_ip,  # 伪装 IP
+        "X-Real-IP": fake_ip         # 伪装 IP
     }
 
+    # 用于记录失败原因，方便排错
+    debug_log = []
     raw_json = None
-    
-    # --- 策略1：极速直连尝试 (如果没被封锁则秒开) ---
+
+    # --- 策略1：注入虚拟IP直连 ---
     try:
-        res = requests.get(target_url, headers=headers, timeout=3)
+        res = requests.get(target_url, headers=headers, timeout=4)
         if res.status_code == 200:
             raw_json = res.json()
-    except Exception:
-        pass
+            if raw_json.get("data"): 
+                return parse_json_to_df(raw_json), "直连+IP伪装"
+            else:
+                debug_log.append("直连成功但被东方财富拦截(返回空data)")
+                raw_json = None
+    except Exception as e:
+        debug_log.append(f"直连失败: {str(e)}")
 
-    # --- 策略2：Allorigins 代理兜底 (专门突破 Streamlit 云服务器 IP 被封) ---
+    encoded_url = urllib.parse.quote(target_url)
+
+    # --- 策略2：Corsproxy 代理兜底 ---
     if not raw_json:
         try:
-            # 将东方财富的接口打包扔给 allorigins 代理节点
-            encoded_url = urllib.parse.quote(target_url)
-            proxy_url = f"https://api.allorigins.win/raw?url={encoded_url}"
-            res = requests.get(proxy_url, timeout=8)
+            proxy_url = f"https://corsproxy.io/?{encoded_url}"
+            res = requests.get(proxy_url, timeout=6)
             if res.status_code == 200:
                 raw_json = res.json()
-        except Exception:
-            return pd.DataFrame() # 如果代理也挂了，返回空
+                if raw_json.get("data"): return parse_json_to_df(raw_json), "Corsproxy代理"
+        except Exception as e:
+            debug_log.append(f"Corsproxy失败: {str(e)}")
 
-    # 安全校验返回数据
-    if not raw_json or "data" not in raw_json or raw_json["data"] is None:
-        return pd.DataFrame()
+    # --- 策略3：Codetabs 代理兜底 ---
+    if not raw_json:
+        try:
+            proxy_url = f"https://api.codetabs.com/v1/proxy?quest={target_url}"
+            res = requests.get(proxy_url, timeout=6)
+            if res.status_code == 200:
+                raw_json = res.json()
+                if raw_json.get("data"): return parse_json_to_df(raw_json), "Codetabs代理"
+        except Exception as e:
+            debug_log.append(f"Codetabs失败: {str(e)}")
 
-    # 解析清洗数据
-    stock_list = raw_json["data"].get("diff", [])
+    # --- 策略4：Allorigins 代理兜底 ---
+    if not raw_json:
+        try:
+            proxy_url = f"https://api.allorigins.win/raw?url={encoded_url}"
+            res = requests.get(proxy_url, timeout=6)
+            if res.status_code == 200:
+                raw_json = res.json()
+                if raw_json.get("data"): return parse_json_to_df(raw_json), "AllOrigins代理"
+        except Exception as e:
+            debug_log.append(f"Allorigins失败: {str(e)}")
+
+    # 如果全军覆没，返回错误日志
+    return pd.DataFrame(), debug_log
+
+def parse_json_to_df(raw_json):
+    stock_list = raw_json.get("data", {}).get("diff", [])
     clean_data = []
-    
     for s in stock_list:
-        # 东方财富对于停牌或者亏损的股票会返回 "-"
         def to_float(val):
             try: return float(val) if val != "-" else 0.0
             except: return 0.0
@@ -79,17 +109,15 @@ def fetch_eastmoney_data(bk_code):
             "换手率(%)": to_float(s.get("f8")),
             "市盈率(PE)": to_float(s.get("f9")),
             "市净率(PB)": to_float(s.get("f23")),
-            # 原始市值是“元”，除以1亿变成“亿元”
             "总市值(亿)": to_float(s.get("f20")) / 100000000.0 if s.get("f20") and s.get("f20") != "-" else 0.0
         })
-        
     return pd.DataFrame(clean_data)
 
 # ==========================================
 # 2. 页面与组件渲染
 # ==========================================
-st.set_page_config(page_title="东方财富底层直通版", layout="wide")
-st.markdown("### 🦅 终极稳定版：直连东方财富 API + 智能代理突破")
+st.set_page_config(page_title="游资板块透视", layout="wide")
+st.markdown("### 🦅 终极反侦察版：多重代理 + IP伪装防拦截")
 
 st.sidebar.header("🎯 1. 选择板块")
 selected_sector = st.sidebar.selectbox("请选择要扫描的板块：", list(BASE_SECTORS.keys()))
@@ -106,10 +134,13 @@ bk_code = BASE_SECTORS[selected_sector]
 st.markdown(f"#### 正在监控：**{selected_sector}** (内部代码: {bk_code})")
 
 # 加载数据
-with st.spinner("🚀 正在呼叫东方财富接口 (若遇云端拦截将自动切换代理)..."):
-    df_stocks = fetch_eastmoney_data(bk_code)
+with st.spinner("🚀 正在注入虚拟IP，尝试突破东方财富封锁..."):
+    result, debug_info = fetch_eastmoney_data(bk_code)
 
-if not df_stocks.empty:
+if not result.empty:
+    df_stocks = result
+    st.success(f"✅ 数据拉取成功！当前使用通道: **{debug_info}**")
+    
     df_filtered = df_stocks.copy()
     
     # 漏斗执行
@@ -121,7 +152,7 @@ if not df_stocks.empty:
     # 按换手降序
     df_filtered = df_filtered.sort_values(by="换手率(%)", ascending=False)
     
-    st.success(f"✅ 底层透视：东方财富该板块共包含 **{len(df_stocks)}** 只股票。漏斗过滤后幸存 **{len(df_filtered)}** 只！")
+    st.info(f"📊 该板块共包含 **{len(df_stocks)}** 只股票。漏斗过滤后幸存 **{len(df_filtered)}** 只！")
     
     if not df_filtered.empty:
         def color_change(val):
@@ -140,4 +171,7 @@ if not df_stocks.empty:
     with st.expander("🔍 展开查看：东方财富返回的【全量原始数据】（无视漏斗）"):
         st.dataframe(df_stocks, use_container_width=True)
 else:
-    st.error("❌ 数据获取失败。可能原因：网络严重波动、休市、或双重节点均被拦截。请几秒后再试。")
+    st.error("❌ 严重错误：突破东方财富失败！所有通道均被拦截！")
+    st.error("👇 错误诊断日志（如果还失败，请把这段日志截图给我看）：")
+    for log in debug_info:
+        st.code(log)
