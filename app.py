@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
 import requests
+import urllib.request
 import urllib.parse
+import json
 import random
 
 # ==========================================
@@ -22,78 +24,69 @@ BASE_SECTORS = {
 }
 
 # ==========================================
-# 1. 终极穿透引擎 (备用节点轮询 + 代理高延迟容忍)
+# 1. 降维打击网络引擎 (HTTP降级 + Urllib原生穿透)
 # ==========================================
 @st.cache_data(ttl=15)
 def fetch_eastmoney_data(bk_code):
-    # 黑科技1：东方财富边缘节点大轮盘，避开主服务器的严厉封锁
-    subdomains = ["push2", "8.push2", "11.push2", "90.push2", "78.push2", "5.push2"]
-    sub = random.choice(subdomains)
-    
-    # 黑科技2：强制使用 https 加密协议
-    target_url = f"https://{sub}.eastmoney.com/api/qt/clist/get?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=b:{bk_code}&fields=f12,f14,f2,f3,f8,f9,f23,f20"
-    
-    # 随机 User-Agent 防止被指纹识别
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+    # 核心修改1：去掉了 HTTPS，恢复纯 HTTP 协议，迎合东方财富老旧服务器
+    # 核心修改2：准备了多个备用节点服务器
+    endpoints = [
+        "http://push2.eastmoney.com/api/qt/clist/get",
+        "http://82.push2.eastmoney.com/api/qt/clist/get",
+        "http://push2n.eastmoney.com/api/qt/clist/get"
     ]
     
+    params = f"pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=b:{bk_code}&fields=f12,f14,f2,f3,f8,f9,f23,f20"
+    
     headers = {
-        "User-Agent": random.choice(user_agents),
-        "Referer": "https://quote.eastmoney.com/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer": "http://quote.eastmoney.com/",
+        "Accept": "application/json, text/plain, */*",
+        "Connection": "keep-alive"
     }
 
     debug_log = []
-    
-    def try_parse(response):
-        """安全解析JSON，防止代理返回死网页导致崩溃"""
+
+    # --- 策略1：使用 Python 原生 Urllib 库直连 (无视 requests 防火墙) ---
+    for base_url in endpoints:
+        full_url = f"{base_url}?{params}"
         try:
-            return response.json()
-        except Exception:
-            return None
+            req = urllib.request.Request(full_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=4) as response:
+                raw_data = response.read().decode('utf-8')
+                json_data = json.loads(raw_data)
+                if json_data and json_data.get("data"):
+                    return parse_json_to_df(json_data), f"原生 Urllib 成功 ({base_url.split('/')[2]})"
+                else:
+                    debug_log.append(f"Urllib [{base_url.split('/')[2]}]: 返回空")
+        except Exception as e:
+            debug_log.append(f"Urllib [{base_url.split('/')[2]}] 失败: {str(e)[:40]}")
 
-    # --- 策略1：加密直连边缘节点 ---
+    # --- 策略2：使用常规 Requests 库直连 ---
+    for base_url in endpoints:
+        full_url = f"{base_url}?{params}"
+        try:
+            res = requests.get(full_url, headers=headers, timeout=4)
+            if res.status_code == 200:
+                json_data = res.json()
+                if json_data and json_data.get("data"):
+                    return parse_json_to_df(json_data), f"Requests 成功 ({base_url.split('/')[2]})"
+        except Exception as e:
+            debug_log.append(f"Requests [{base_url.split('/')[2]}] 失败: {str(e)[:40]}")
+
+    # --- 策略3：AllOrigins 包装代理 (避免 Raw 超时) ---
     try:
-        res = requests.get(target_url, headers=headers, timeout=5)
+        # 这次不用 raw，而是用 get 将数据包装成 JSON，解决上次 Read timed out 的问题
+        proxy_url = f"https://api.allorigins.win/get?url={urllib.parse.quote(endpoints[0] + '?' + params)}"
+        res = requests.get(proxy_url, timeout=12)
         if res.status_code == 200:
-            raw_json = try_parse(res)
-            if raw_json and raw_json.get("data"): 
-                return parse_json_to_df(raw_json), f"直连穿透 ({sub}节点)"
-            else:
-                debug_log.append(f"直连[{sub}]: 被拦截返回非数据内容")
+            wrapper = res.json()
+            if "contents" in wrapper:
+                json_data = json.loads(wrapper["contents"])
+                if json_data and json_data.get("data"):
+                    return parse_json_to_df(json_data), "AllOrigins (JSON包装模式)"
     except Exception as e:
-        debug_log.append(f"直连失败: {str(e)[:50]}")
-
-    encoded_url = urllib.parse.quote(target_url)
-
-    # --- 策略2：Allorigins 超长续航 (解决 Read timed out 痛点) ---
-    try:
-        proxy_url = f"https://api.allorigins.win/raw?url={encoded_url}"
-        # 核心：将超时从 6 秒拉大到 15 秒！等它！
-        res = requests.get(proxy_url, timeout=15)
-        if res.status_code == 200:
-            raw_json = try_parse(res)
-            if raw_json and raw_json.get("data"): 
-                return parse_json_to_df(raw_json), "AllOrigins(15秒高延迟兜底)"
-            else:
-                debug_log.append("Allorigins: 返回了错误的数据格式")
-    except Exception as e:
-        debug_log.append(f"Allorigins失败: {str(e)[:50]}")
-
-    # --- 策略3：Thingproxy 备用通道 ---
-    try:
-        proxy_url = f"https://thingproxy.freeboard.io/fetch/{target_url}"
-        res = requests.get(proxy_url, timeout=10)
-        if res.status_code == 200:
-            raw_json = try_parse(res)
-            if raw_json and raw_json.get("data"): 
-                return parse_json_to_df(raw_json), "ThingProxy通道"
-            else:
-                debug_log.append("ThingProxy: 格式错误或被阻挡")
-    except Exception as e:
-        debug_log.append(f"ThingProxy失败: {str(e)[:50]}")
+        debug_log.append(f"AllOrigins 包装模式失败: {str(e)[:40]}")
 
     return pd.DataFrame(), debug_log
 
@@ -121,7 +114,7 @@ def parse_json_to_df(raw_json):
 # 2. 页面与组件渲染
 # ==========================================
 st.set_page_config(page_title="游资板块透视", layout="wide")
-st.markdown("### 🦅 游资雷达：东方财富直连防断版")
+st.markdown("### 🦅 游资雷达：原生 HTTP 降维打击版")
 
 st.sidebar.header("🎯 1. 选择板块")
 selected_sector = st.sidebar.selectbox("请选择要扫描的板块：", list(BASE_SECTORS.keys()))
@@ -138,7 +131,7 @@ bk_code = BASE_SECTORS[selected_sector]
 st.markdown(f"#### 正在监控：**{selected_sector}** (内部代码: {bk_code})")
 
 # 加载数据
-with st.spinner("🚀 正在强行穿透东方财富服务器 (最长可能等待15秒，请耐心)..."):
+with st.spinner("🚀 正在使用纯净 HTTP 协议请求数据 (预计2~5秒)..."):
     result, debug_info = fetch_eastmoney_data(bk_code)
 
 if not result.empty:
@@ -175,7 +168,7 @@ if not result.empty:
     with st.expander("🔍 展开查看：东方财富返回的【全量原始数据】（无视漏斗）"):
         st.dataframe(df_stocks, use_container_width=True)
 else:
-    st.error("❌ 破防失败！15秒超时内未能穿透。")
+    st.error("❌ 拉取失败！")
     st.error("👇 错误诊断日志：")
     for log in debug_info:
         st.code(log)
