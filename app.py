@@ -1,138 +1,141 @@
 import streamlit as st
 import pandas as pd
-import requests
-import re
-import json
+import akshare as ak
+import datetime
 
 # ==========================================
-# 0. 新浪财经专属板块代码 (拼音缩写/行业代码)
+# 核心数据引擎 (纯情绪与资金面)
 # ==========================================
-SINA_SECTORS = {
-    "📌【特加】稀土永磁": "concept_xtyc",
-    "📌【特加】化工行业(化学制品)": "sinaindustry_42", 
-    "📌【特加】有色金属": "sinaindustry_50",
-    "【概念】低空经济": "concept_dkjj",      # 注：新概念若新浪未更新可能为空
-    "【概念】机器人概念": "concept_jqr",
-    "【概念】固态电池": "concept_gtdc",
-    "【概念】人工智能": "concept_rgzn",
-    "【概念】算力租赁": "concept_slgn",
-    "【行业】半导体": "sinaindustry_46",
-    "【行业】汽车整车": "sinaindustry_43",
-    "【行业】医疗器械": "sinaindustry_38"
-}
-
-# ==========================================
-# 1. 新浪财经直连引擎 (完全无视拦截)
-# ==========================================
-@st.cache_data(ttl=15)
-def fetch_sina_data(node_code):
-    # 新浪财经 VIP 节点，按涨跌幅排序，拉取前 500 只股票
-    target_url = f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=500&sort=changepercent&asc=0&node={node_code}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "http://finance.sina.com.cn/"
-    }
-
+@st.cache_data(ttl=300)
+def get_longhubang_data(date_str):
+    """获取指定日期的龙虎榜详情（寻找资金净流入的核心标的）"""
     try:
-        # 新浪接口从不拦截，直接使用 requests 裸连即可
-        res = requests.get(target_url, headers=headers, timeout=8)
-        text = res.text
-        
-        if not text or text.strip() == "null":
-            return pd.DataFrame(), "新浪数据库尚未收录该板块"
-
-        # 黑科技：新浪返回的 JSON 键值没有双引号 (比如 {symbol:"sh600..."})，Python 会报错
-        # 我们用正则表达式强行给它的 Key 加上双引号，修复新浪的 JSON
-        fixed_text = re.sub(r'([{,])\s*([a-zA-Z_0-9]+)\s*:', r'\1"\2":', text)
-        
-        raw_json = json.loads(fixed_text)
-        
-        if not raw_json or len(raw_json) == 0:
-            return pd.DataFrame(), "该板块目前为空"
+        # 东方财富-龙虎榜详情接口
+        df = ak.stock_lhb_detail_em(start_date=date_str, end_date=date_str)
+        if df.empty:
+            return pd.DataFrame()
             
-        return parse_sina_to_df(raw_json), "新浪财经 VIP 接口直连"
+        # 提取有用字段并清洗
+        df = df[["代码", "名称", "涨跌幅", "收盘价", "龙虎榜净买额", "换手率", "上榜原因"]]
         
+        # 将数据转为数值型进行排序
+        df["龙虎榜净买额"] = pd.to_numeric(df["龙虎榜净买额"], errors="coerce") / 10000.0 # 转换为万元
+        df["涨跌幅"] = pd.to_numeric(df["涨跌幅"], errors="coerce")
+        df["换手率"] = pd.to_numeric(df["换手率"], errors="coerce")
+        
+        # 按净买额从大到小排序，只看真金白银流入的
+        df = df.sort_values(by="龙虎榜净买额", ascending=False)
+        return df
     except Exception as e:
-        return pd.DataFrame(), f"请求出错: {str(e)[:50]}"
+        return pd.DataFrame()
 
-def parse_sina_to_df(raw_json):
-    clean_data = []
-    for s in raw_json:
-        def to_float(val):
-            try: return float(val)
-            except: return 0.0
-
-        clean_data.append({
-            "代码": str(s.get("symbol", "")).replace("sh", "").replace("sz", ""),
-            "名称": str(s.get("name", "")),
-            "最新价": to_float(s.get("trade")),
-            "涨跌幅(%)": to_float(s.get("changepercent")),
-            "换手率(%)": to_float(s.get("turnoverratio")),
-            "市盈率(PE)": to_float(s.get("per")),
-            "市净率(PB)": to_float(s.get("pb")),
-            # 新浪的总市值单位是"万元"，需要除以10000转换成"亿元"
-            "总市值(亿)": to_float(s.get("mktcap")) / 10000.0
-        })
-    return pd.DataFrame(clean_data)
+@st.cache_data(ttl=300)
+def get_limit_up_pool(date_str):
+    """获取指定日期的涨停板池（寻找连板龙头和炒作小作文）"""
+    try:
+        # 东方财富-涨停板池接口 (date参数格式: 20231012)
+        date_format = date_str.replace("-", "")
+        df = ak.stock_zt_pool_em(date=date_format)
+        if df.empty:
+            return pd.DataFrame()
+            
+        # 提取连板天数、所属概念（小作文）
+        df = df[["代码", "名称", "涨跌幅", "最新价", "换手率", "连板数", "所属行业", "涨停统计"]]
+        
+        # 处理数据
+        df["连板数"] = pd.to_numeric(df["连板数"], errors="coerce").fillna(1)
+        
+        # 按连板数降序排序，寻找绝对龙头
+        df = df.sort_values(by=["连板数", "换手率"], ascending=[False, False])
+        return df
+    except Exception as e:
+        return pd.DataFrame()
 
 # ==========================================
-# 2. 页面与组件渲染
+# 页面与组件渲染
 # ==========================================
-st.set_page_config(page_title="游资板块透视", layout="wide")
-st.markdown("### 🦅 游资雷达：新浪财经光速直连版")
+st.set_page_config(page_title="游资情绪与龙虎榜雷达", layout="wide", initial_sidebar_state="expanded")
+st.markdown("### 🐉 A股核心内参：游资龙虎榜 & 情绪梯队雷达")
+st.caption("放弃 PE/PB 执念，拥抱 A 股本质：看清资金流向，跟随连板情绪，顺应政策题材！")
 
-st.sidebar.header("🎯 1. 选择板块")
-selected_sector = st.sidebar.selectbox("请选择要扫描的板块：", list(SINA_SECTORS.keys()))
+# 侧边栏：交易日选择
+st.sidebar.header("⏱️ 1. 时间机器")
+st.sidebar.caption("提示：龙虎榜数据通常在交易日 17:00 之后才会全量更新。盘中建议查看前一交易日数据。")
+
+# 默认获取最近的交易日（简单处理：如果是周末，往前推。这里提供手动选择）
+today = datetime.datetime.now().date()
+selected_date = st.sidebar.date_input("选择要复盘的交易日", value=today)
+date_str = selected_date.strftime("%Y-%m-%d")
 
 st.sidebar.markdown("---")
-st.sidebar.header("🎯 2. 量化漏斗过滤")
-st.sidebar.caption("提示：主界面无数据时，把换手率调到0即可看到所有股")
-max_pe = st.sidebar.slider("最大动态市盈率 (PE)", 0, 500, 100)
-max_mkt_cap = st.sidebar.slider("最大总市值 (亿)", 10, 5000, 1000)
-min_turn = st.sidebar.number_input("最小换手率 (%) [填0看全部]", value=2.0, step=0.5)
-price_range = st.sidebar.slider("今日涨跌幅区间 (%)", -10.0, 11.0, (-10.0, 11.0), step=0.5)
+st.sidebar.header("🎯 2. 资金漏斗过滤")
+min_net_buy = st.sidebar.number_input("龙虎榜最小净买入 (万元)", value=1000, step=1000, help="过滤掉游资只是做T或者净流出的股票")
+min_streak = st.sidebar.slider("最少连板数 (抓龙头)", 1, 15, 1, help="1为首板，只看妖股可以调高此数值")
 
-node_code = SINA_SECTORS[selected_sector]
-st.markdown(f"#### 正在监控：**{selected_sector}** (新浪节点: {node_code})")
+# ==========================================
+# 模块一：游资真金白银 —— 龙虎榜净买入追踪
+# ==========================================
+st.markdown(f"#### 💰 榜单一：【{date_str}】 龙虎榜主力净买入追踪")
+with st.spinner("正在从东方财富底层提取龙虎榜游资席位数据..."):
+    df_lhb = get_longhubang_data(date_str)
 
-# 加载数据
-with st.spinner("🚀 正在从新浪财经拉取实时数据 (预计 1~2 秒)..."):
-    df_stocks, status_msg = fetch_sina_data(node_code)
-
-if not df_stocks.empty:
-    st.success(f"✅ 数据拉取成功！通道状态: **{status_msg}**")
+if not df_lhb.empty:
+    # 漏斗过滤：只看净买入大于设定值的
+    df_lhb_filtered = df_lhb[df_lhb["龙虎榜净买额"] >= min_net_buy]
     
-    df_filtered = df_stocks.copy()
+    st.info(f"当天共有 {len(df_lhb)} 只股票上榜，其中净买入超过 {min_net_buy} 万元的硬核资金票有 **{len(df_lhb_filtered)}** 只！")
     
-    # 漏斗执行
-    df_filtered = df_filtered[(df_filtered['市盈率(PE)'] > 0) & (df_filtered['市盈率(PE)'] <= max_pe)]
-    df_filtered = df_filtered[df_filtered['总市值(亿)'] <= max_mkt_cap]
-    df_filtered = df_filtered[df_filtered['换手率(%)'] >= min_turn]
-    df_filtered = df_filtered[(df_filtered['涨跌幅(%)'] >= price_range[0]) & (df_filtered['涨跌幅(%)'] <= price_range[1])]
-    
-    # 按换手降序
-    df_filtered = df_filtered.sort_values(by="换手率(%)", ascending=False)
-    
-    st.info(f"📊 该板块共包含 **{len(df_stocks)}** 只股票。漏斗过滤后幸存 **{len(df_filtered)}** 只！")
-    
-    if not df_filtered.empty:
-        def color_change(val):
-            return f"color: {'red' if val > 0 else 'green' if val < 0 else 'gray'}"
+    if not df_lhb_filtered.empty:
+        # 样式渲染
+        def style_positive(val):
+            return f"color: {'red' if val > 0 else 'green' if val < 0 else 'gray'}; font-weight: bold"
             
-        styled_df = df_filtered.style.map(color_change, subset=['涨跌幅(%)'])\
-                            .format({
-                                "最新价": "{:.2f}", "涨跌幅(%)": "{:.2f}%", 
-                                "换手率(%)": "{:.2f}%", "市盈率(PE)": "{:.2f}", 
-                                "市净率(PB)": "{:.2f}", "总市值(亿)": "{:.2f}"
-                            })
-        st.dataframe(styled_df, use_container_width=True, height=450)
-    else:
-        st.warning("⚠️ 漏斗条件太苛刻！你把左侧的【最小换手率】改成 0 看看。")
-        
-    with st.expander("🔍 展开查看：新浪财经返回的【全量原始数据】（无视漏斗）"):
-        st.dataframe(df_stocks, use_container_width=True)
+        st.dataframe(
+            df_lhb_filtered.style.map(style_positive, subset=['涨跌幅', '龙虎榜净买额'])\
+            .format({"涨跌幅": "{:.2f}%", "换手率": "{:.2f}%", "龙虎榜净买额": "{:.0f} 万"}),
+            use_container_width=True, height=350
+        )
 else:
-    st.warning(f"📭 当前板块暂无数据。")
-    st.error(f"系统提示：**{status_msg}**")
-    st.info("💡 解释：如果是【低空经济】这种2024年刚出的新概念，新浪财经官方可能还未给它建立专属板块数据库，建议查看其他经典老版块！")
+    st.warning("📭 当前日期没有获取到龙虎榜数据（可能是周末、节假日，或者今天的数据还没更新，请选昨天的日期试试）。")
+
+st.markdown("---")
+
+# ==========================================
+# 模块二：市场情绪标尺 —— 涨停连板梯队与题材
+# ==========================================
+st.markdown(f"#### 🚀 榜单二：【{date_str}】 市场情绪连板梯队 (抓妖股/看小作文)")
+with st.spinner("正在扫描全市场涨停板与背后的政策题材..."):
+    df_zt = get_limit_up_pool(date_str)
+
+if not df_zt.empty:
+    df_zt_filtered = df_zt[df_zt["连板数"] >= min_streak]
+    
+    # 统计最高连板（寻找市场总龙头）
+    max_streak = int(df_zt["连板数"].max())
+    
+    st.success(f"🔥 当日全市场涨停 **{len(df_zt)}** 家！当前市场最高连板高度：**{max_streak} 连板** （这就是全场总龙头）")
+    
+    if not df_zt_filtered.empty:
+        # 高亮连板数和题材
+        def highlight_streak(val):
+            if val >= 4: return 'background-color: darkred; color: white; font-weight: bold'
+            elif val >= 2: return 'background-color: maroon; color: white'
+            return ''
+
+        st.dataframe(
+            df_zt_filtered.style.map(highlight_streak, subset=['连板数'])\
+            .format({"涨跌幅": "{:.2f}%", "换手率": "{:.2f}%", "连板数": "{:.0f}"}),
+            use_container_width=True, height=500
+        )
+else:
+    st.warning("📭 当前日期未获取到涨停池数据。")
+
+# ==========================================
+# 底部：交易逻辑提示
+# ==========================================
+with st.expander("💡 游资接力核心逻辑（必读）", expanded=True):
+    st.markdown("""
+    1. **看懂梯队**：市场就像金字塔。最高连板是【总龙头】（如7板），往下是【中位股】（3-4板），底层是【首板跟风】。游资的铁律是**买龙头，抛中位，试首板**。
+    2. **看懂龙虎榜**：不要光看游资买，要看是不是**净买入（买入额远大于卖出额）**。如果榜上全是“拉萨营业部（散户大本营）”在买，说明主力已经出货，次日大概率大跌；如果是知名游资（如陈小群、炒股养家）主买，次日溢价高。
+    3. **看懂题材（小作文）**：榜单二中的【所属行业/概念】决定了风口。如果当天涨停板里有20只都是“低空经济”，那它就是绝对主线，闭着眼睛去主线里找票；如果各个概念只有1-2只涨停，说明市场处于混沌期，管住手。
+    """)
